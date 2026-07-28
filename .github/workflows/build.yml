@@ -47,31 +47,6 @@ jobs:
           # ccache speeds up any re-runs of this workflow substantially
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
-      - name: Build Arm Compute Library (ACL)
-        # ACL is oneDNN's recommended GEMM backend on AArch64 (fp32 + bf16 kernels) —
-        # separate from, and complementary to, the XNNPACK i8mm/bf16 kernels below.
-        # Not bundled as a PyTorch submodule as of 2.13 — built standalone, then
-        # pointed to via ACL_ROOT_DIR during the PyTorch build step.
-        #
-        # NOTE: ACL's scons `arch=` option is a fixed enum, NOT a raw -march string —
-        # it does not accept "armv8.7-a" (confirmed: scons prints the valid list on
-        # error, and armv8.7-a isn't one of them; valid neighbors are armv8.6-a,
-        # armv8.6-a-sve, armv8.6-a-sve2, armv8.6-a-sve2-sme2, arm64-v8.2-a, etc).
-        # armv8.6-a is the correct choice here: it's the highest defined floor below
-        # our actual armv8.7-a core, and does not imply SVE/SVE2/SME (those are
-        # separate suffixed variants we deliberately do not select, matching your
-        # CPU's real feature set). This only affects how ACL's own kernels are
-        # compiled — the PyTorch/XNNPACK -march flags below stay at armv8.7-a,
-        # since GCC/Clang's -march flag is a different mechanism that does
-        # correctly accept armv8.7-a directly.
-        run: |
-          git clone --depth 1 --branch v25.02 \
-            https://github.com/ARM-software/ComputeLibrary.git "$HOME/ComputeLibrary"
-          cd "$HOME/ComputeLibrary"
-          scons Werror=1 -j4 debug=0 neon=1 opencl=0 embed_kernels=0 \
-            os=linux arch=armv8.6-a build=native multi_isa=1
-          echo "ACL_ROOT_DIR=$HOME/ComputeLibrary" >> "$GITHUB_ENV"
-
       - name: Set up Python venv
         run: |
           python3 -m venv "$HOME/build-env"
@@ -95,6 +70,58 @@ jobs:
           echo "Building for: armv8.7-a with dotprod, i8mm, bf16"
           echo "This matches 2nd-gen Oryon (Snapdragon 8 Elite / SM8750)."
           echo "NOTE: no sve/sve2/sme on this core generation — do not add them."
+
+      - name: Determine required ACL version from PyTorch's own source
+        # PyTorch bundles a specific oneDNN snapshot (third_party/ideep/mkl-dnn),
+        # and THAT snapshot's ACL.cmake states the minimum ACL version it accepts —
+        # not the standalone oneDNN project's current README, which moves independently
+        # and can be ahead of what any given PyTorch release actually vendors.
+        # This grep reads the requirement straight from the checked-out ref, so this
+        # step can't silently go stale as PyTorch/oneDNN/ACL version independently.
+        id: acl_version
+        run: |
+          ACL_CMAKE="$HOME/pytorch/third_party/ideep/mkl-dnn/cmake/ACL.cmake"
+          if [ ! -f "$ACL_CMAKE" ]; then
+            echo "Could not find $ACL_CMAKE — submodule layout may have changed."
+            exit 1
+          fi
+          echo "--- Relevant excerpt from PyTorch's vendored ACL.cmake ---"
+          grep -i -B2 -A2 "minimum compatible\|ACL_MINIMUM_VERSION\|find_package(ACL" "$ACL_CMAKE" || true
+          echo "-----------------------------------------------------------"
+          echo "Read the minimum version printed above manually if the next"
+          echo "step's chosen tag turns out to be wrong — this step's only"
+          echo "job is to surface the real requirement in the log before we guess."
+
+      - name: Build Arm Compute Library (ACL)
+        # ACL is oneDNN's recommended GEMM backend on AArch64 (fp32 + bf16 kernels) —
+        # separate from, and complementary to, the XNNPACK i8mm/bf16 kernels below.
+        # Not bundled as a PyTorch submodule — built standalone here, then pointed
+        # to via ACL_ROOT_DIR during the PyTorch build step.
+        #
+        # Version note: ACL's own tagging moved from "vYY.MM" (e.g. v25.02) to a
+        # "v52.x" scheme partway through 2025. As of this writing the newest
+        # published ACL tag is v52.8.0. PyTorch's vendored oneDNN snapshot may
+        # require a version at or above this — if the build step below still
+        # reports a version mismatch, check the log output from the step above
+        # for the exact minimum PyTorch's source actually demands, and update
+        # the --branch value here to the closest matching or newer ACL tag
+        # (see https://github.com/ARM-software/ComputeLibrary/tags for the
+        # current list — do not guess a tag without checking that list first).
+        #
+        # NOTE: ACL's scons `arch=` option is a fixed enum, NOT a raw -march string —
+        # it does not accept "armv8.7-a" (scons prints the valid list on error).
+        # armv8.6-a is the correct choice: highest defined floor below our actual
+        # armv8.7-a core, without implying SVE/SVE2/SME (which this CPU lacks).
+        # This only affects how ACL's own kernels are compiled — the PyTorch/
+        # XNNPACK -march flags below stay at armv8.7-a, since GCC/Clang's -march
+        # is a different mechanism that does correctly accept armv8.7-a directly.
+        run: |
+          git clone --depth 1 --branch v52.8.0 \
+            https://github.com/ARM-software/ComputeLibrary.git "$HOME/ComputeLibrary"
+          cd "$HOME/ComputeLibrary"
+          scons Werror=1 -j4 debug=0 neon=1 opencl=0 embed_kernels=0 \
+            os=linux arch=armv8.6-a build=native multi_isa=1
+          echo "ACL_ROOT_DIR=$HOME/ComputeLibrary" >> "$GITHUB_ENV"
 
       - name: Build PyTorch wheel
         working-directory: /home/runner/pytorch
